@@ -21,6 +21,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
@@ -120,6 +122,24 @@ class Resolution:
     @property
     def ok(self) -> bool:
         return not self.conflicts
+
+    def fingerprint(self) -> str:
+        """按四张表的主键集合计算交付内容的指纹。
+
+        源库在同一次上传内不变，行内容由主键唯一确定，因此主键集合相同
+        即四张表中实际写入的记录完全相同。勾选/剔除方式可以不同。
+        """
+        payload = json.dumps(
+            {
+                "groups": sorted(self.group_ids),
+                "calibrations": sorted(self.calibration_ids),
+                "tests": sorted(self.test_ids),
+                "readings": sorted(self.reading_ids),
+            },
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def _test_label(model: Model, tid: int) -> str:

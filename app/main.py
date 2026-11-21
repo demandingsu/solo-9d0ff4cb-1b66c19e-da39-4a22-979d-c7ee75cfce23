@@ -5,10 +5,10 @@
 """
 from __future__ import annotations
 
+import html
 import os
 import shutil
 import sqlite3
-import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .core import build_subset, load_model, resolve, validate_schema
+from .subset_cache import CacheEntry, SubsetBuildError, SubsetCache
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -33,10 +34,16 @@ class SessionState:
     source_name: str
     selected_tests: set[int] = field(default_factory=set)
     excluded_readings: set[int] = field(default_factory=set)
+    # 每次上传独立的子库缓存：不同勾选只要解析结果相同即命中同一条目
+    cache: SubsetCache = field(default_factory=SubsetCache)
 
     @property
     def db_path(self) -> str:
         return os.path.join(self.workdir, "source.db")
+
+    def next_subset_path(self) -> str:
+        # 并行的不同内容构建各自取唯一文件名
+        return os.path.join(self.workdir, f"subset_{uuid.uuid4().hex}.db")
 
 
 # 单进程内存会话；重启即失效（上传文件保留在 DATA_DIR 下，由运维清理）
@@ -151,7 +158,11 @@ def select_page(request: Request):
                 )
             ]
             tests.append(
-                {"row": t, "readings": readings, "selected": t["id"] in st.selected_tests}
+                {
+                    "row": t,
+                    "readings": readings,
+                    "selected": t["id"] in st.selected_tests,
+                }
             )
         groups.append({"row": g, "tests": tests})
 
@@ -209,6 +220,11 @@ def preview(request: Request):
 
 @app.post("/download")
 def download(request: Request):
+    """生成（或复用）当前选择的交付子库并下载。
+
+    内容相同的子库在一次上传内只生成一次：同时到达的请求等待首个请求
+    生成完成后复用同一文件；不同内容各自并行生成。
+    """
     st = _get_session(request)
     if not st:
         return RedirectResponse("/", status_code=303)
@@ -222,9 +238,74 @@ def download(request: Request):
             "或回 <a href='/select'>选择页</a> 修改。</p>",
             status_code=409,
         )
-    out_path = os.path.join(st.workdir, f"subset_{int(time.time() * 1000)}.db")
-    build_subset(st.db_path, out_path, res)
+
+    fingerprint = res.fingerprint()
     name = os.path.splitext(st.source_name)[0] + "_subset.db"
-    return FileResponse(
-        out_path, filename=name, media_type="application/x-sqlite3"
+
+    def build() -> str:
+        out_path = st.next_subset_path()
+        try:
+            build_subset(st.db_path, out_path, res)
+        except BaseException:
+            # 失败时不留半成品文件
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+        return out_path
+
+    try:
+        entry, outcome = st.cache.get_or_build(fingerprint, build)
+    except SubsetBuildError as exc:
+        return HTMLResponse(
+            _download_error_page(str(exc)), status_code=500
+        )
+
+    try:
+        response = _stream_entry(st, entry, name)
+    except BaseException:
+        st.cache.release(entry)
+        raise
+    response.headers["x-subset-cache"] = outcome
+    return response
+
+
+class _ReleasingFileResponse(FileResponse):
+    """下载响应结束后释放缓存条目的使用者名额。
+
+    流式发送期间条目 users > 0，即使已被淘汰也不会删文件；
+    响应结束（含客户端断开/异常）后再按需删除。
+    """
+
+    def __init__(self, *args, on_close, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._on_close()
+
+
+def _stream_entry(st: SessionState, entry: CacheEntry, name: str):
+    def on_close() -> None:
+        st.cache.release(entry)
+
+    return _ReleasingFileResponse(
+        entry.path,
+        filename=name,
+        media_type="application/x-sqlite3",
+        on_close=on_close,
+    )
+
+
+def _download_error_page(detail: str) -> str:
+    return (
+        "<h2>子库生成失败</h2>"
+        f"<p class='err'>本次子库生成或外键校验失败：{html.escape(detail)}</p>"
+        "<p>所有等待该子库的请求都已收到失败提示；失败结果未缓存，"
+        "可返回 <a href='/preview'>预览页</a> 重新下载，"
+        "或回 <a href='/select'>选择页</a> 修改。</p>"
     )
